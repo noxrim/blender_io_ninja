@@ -1,16 +1,28 @@
 import bpy
 import bmesh
-import mathutils
+import math
 import os
 import struct
-import io
+import re
+
+from bpy_extras.io_utils import axis_conversion
+from mathutils import (
+    Vector,
+    Matrix,
+    Euler,
+)
 
 DEBUG = True
 
-_ptr_offset = 0
-
 def debug_print(msg):
     if DEBUG: print(msg)
+
+def angle_to_rad(angle):
+    # ninja stores angles in unsigned 32bit ints
+    # 0xffff = 1 full rotation
+    # negative angles just wrap around to the high end
+    if angle >= 0x7fff_ffff: angle -= 0xffff_ffff
+    return (angle / 0xffff) * 2 * math.pi
 
 def parse_chunk_model_vlist(mesh, buffer, base):
     chunk_cursor = base
@@ -25,7 +37,7 @@ def parse_chunk_model_vlist(mesh, buffer, base):
 
 
         if chunk_type_identifier >= 0x20 and chunk_type_identifier <= 0x32: # vertex chunk
-            debug_print(f"Vertex chunk at {chunk_cursor}")
+            debug_print(f"VLIST: Vertex chunk at {chunk_cursor}")
 
             # vertex format flags in chunk header
             fmt_sh = fmt_vn = fmt_d8 = fmt_uf = fmt_nf = fmt_s5 = fmt_s4 = fmt_in = fmt_nx = False
@@ -54,8 +66,6 @@ def parse_chunk_model_vlist(mesh, buffer, base):
             # vertex count, always present after chunk header
             num_vertices = int.from_bytes(buffer[chunk_cursor+4:chunk_cursor+8], 'little') >> 16
             vertex_cursor = chunk_cursor + 8
-            debug_print(f"Num vertices: {num_vertices}")
-            debug_print(f"Vertex format: {chunk_type_identifier:02x}")
 
             # get/create attribute layers
             color_layer = mesh.verts.layers.color.get("NinjaColor")
@@ -69,7 +79,7 @@ def parse_chunk_model_vlist(mesh, buffer, base):
                 
                 # position
                 
-                vertex.co = mathutils.Vector(struct.unpack('<fff', buffer[vertex_cursor+0:vertex_cursor+12]))
+                vertex.co = Vector(struct.unpack('<fff', buffer[vertex_cursor+0:vertex_cursor+12]))
                 vertex_cursor += 12
                 if fmt_sh: 
                     vertex_cursor += 4
@@ -77,7 +87,7 @@ def parse_chunk_model_vlist(mesh, buffer, base):
                 # normal
                 
                 if fmt_vn:
-                    vertex.normal = mathutils.Vector(struct.unpack('<fff', buffer[vertex_cursor+0:vertex_cursor+12]))
+                    vertex.normal = Vector(struct.unpack('<fff', buffer[vertex_cursor+0:vertex_cursor+12]))
                     vertex_cursor += 12
                     if fmt_sh: 
                         vertex_cursor += 4
@@ -108,15 +118,12 @@ def parse_chunk_model_vlist(mesh, buffer, base):
                     # TODO
                     vertex_cursor += 4
                 
-            debug_print(f"Vertex cursor after reading data: {vertex_cursor}")
-
-
         elif chunk_type_identifier == 0xff: # end chunk
-            debug_print(f"End chunk at {chunk_cursor}")
+            debug_print(f"VLIST: End chunk at {chunk_cursor}")
             break
 
         else:
-            debug_print(f"Unrecognized chunk type 0x{chunk_type_identifier:02x} at {chunk_cursor} while parsing vlist")
+            debug_print(f"VLIST: Unrecognized chunk type 0x{chunk_type_identifier:02x} at {chunk_cursor}")
             return
         
         chunk_cursor += 4
@@ -141,22 +148,25 @@ def parse_chunk_model_plist(mesh, buffer, base):
         chunk_type_identifier = chunk_type & 0xff
         chunk_type_flags = chunk_type >> 8
 
-        if chunk_type_identifier >= 0x08 and chunk_type_identifier <= 0x09: # tiny chunk (texture index)
-            debug_print(f"Tiny chunk at {chunk_cursor}")
+        if chunk_type_identifier >= 0x01 and chunk_type_identifier <= 0x05: # Bits chunk
+            debug_print(f"PLIST: Bits chunk at {chunk_cursor}")
+            # TODO
+
+        elif chunk_type_identifier >= 0x08 and chunk_type_identifier <= 0x09: # tiny chunk (texture index)
+            debug_print(f"PLIST: Tiny chunk at {chunk_cursor}")
             chunk_size = 0 # this chunk stores stuff in the size bytes and the actual size of the chunk is 0
             # TODO
 
         elif chunk_type_identifier >= 0x11 and chunk_type_identifier <= 0x1f: # material chunk
-            debug_print(f"Material chunk at {chunk_cursor}")
-            chunk_cursor
+            debug_print(f"PLIST: Material chunk at {chunk_cursor}")
             # TODO
 
         elif chunk_type_identifier >= 0x38 and chunk_type_identifier <= 0x3a: # volume chunk (loose triangles)
-            debug_print(f"Volume chunk at {chunk_cursor}")
+            debug_print(f"PLIST: Volume chunk at {chunk_cursor}")
             # TODO
 
         elif chunk_type_identifier >= 0x40 and chunk_type_identifier <= 0x4b: # strip chunk (triangle strips)
-            debug_print(f"Strip chunk at {chunk_cursor}")
+            debug_print(f"PLIST: Strip chunk at {chunk_cursor}")
             
             uv_type = (chunk_type_identifier - 0x40) % 3 # 0=none, 1=lowres(256), 2=highres(1024)
             extra_type = (chunk_type_identifier - 0x40) // 3 # 0=none, 1=vertex normal, 2=diffuse color, 3=second uv layer
@@ -172,8 +182,6 @@ def parse_chunk_model_plist(mesh, buffer, base):
             num_strips &= 0x3fff
             strip_cursor = chunk_cursor + 6
             
-            debug_print(f"Num strips: {num_strips}")
-
             # get/create attribute layers
             uv_layer = mesh.loops.layers.uv.get("NinjaUV")
             if uv_layer == None and uv_type != 0: 
@@ -189,7 +197,7 @@ def parse_chunk_model_plist(mesh, buffer, base):
 
             # read strip data
             for i in range(num_strips):
-                debug_print(f"Strip {i}/{num_strips}")
+                #debug_print(f"Strip {i}/{num_strips}")
                 num_indices = int.from_bytes(buffer[strip_cursor:strip_cursor+2], 'little', signed=True)
                 strip_flip = (num_indices < 0)
                 num_indices = abs(num_indices)
@@ -199,19 +207,19 @@ def parse_chunk_model_plist(mesh, buffer, base):
                 vertex_window = []
 
                 for j in range(num_indices):
-                    debug_print(f"Strip piece {j}/{num_indices}")
+                    #debug_print(f"Strip piece {j}/{num_indices}")
                     vert_obj = ChunkStripVert()
 
                     index = int.from_bytes(buffer[strip_cursor:strip_cursor+2], 'little')
                     vert_obj.index = index
-                    debug_print(f"Index={index}")
+                    #debug_print(f"Index={index}")
 
                     strip_cursor += 2
 
                     if uv_type != 0:
                         u = int.from_bytes(buffer[strip_cursor:strip_cursor+2], 'little')
                         v = int.from_bytes(buffer[strip_cursor+2:strip_cursor+4], 'little')
-                        vert_obj.uv = mathutils.Vector((u/uv_res, v/uv_res))
+                        vert_obj.uv = Vector((u/uv_res, v/uv_res))
                         strip_cursor += 4
 
                     match extra_type:
@@ -221,12 +229,12 @@ def parse_chunk_model_plist(mesh, buffer, base):
                         case 2: # diffuse color
                             ar = int.from_bytes(buffer[strip_cursor:strip_cursor+2], 'little')
                             gb = int.from_bytes(buffer[strip_cursor+2:strip_cursor+4], 'little')
-                            mesh.verts[index][color_layer] = mathutils.Vector((ar&0xff, gb>>8, gb&0xff, ar>>8))
+                            mesh.verts[index][color_layer] = Vector((ar&0xff, gb>>8, gb&0xff, ar>>8))
                             strip_cursor += 4
                         case 3: # uv 2
                             u = int.from_bytes(buffer[strip_cursor:strip_cursor+2], 'little')
                             v = int.from_bytes(buffer[strip_cursor+2:strip_cursor+4], 'little')
-                            vert_obj.uv2 = mathutils.Vector(u/uv_res, v/uv_res)
+                            vert_obj.uv2 = Vector(u/uv_res, v/uv_res)
                             strip_cursor += 4
 
 
@@ -257,17 +265,17 @@ def parse_chunk_model_plist(mesh, buffer, base):
                         vertex_window.pop(0)
                         strip_cursor += num_userflags * 2
             
-            debug_print(f"Strip cursor after read: {strip_cursor}")
+            #debug_print(f"Strip cursor after read: {strip_cursor}")
 
         elif chunk_type_identifier == 0x00: # null chunk
-            debug_print(f"Null chunk at {chunk_cursor}")
+            debug_print(f"PLIST: Null chunk at {chunk_cursor}")
 
         elif chunk_type_identifier == 0xff: # end chunk
-            debug_print(f"End chunk at {chunk_cursor}")
+            debug_print(f"PLIST: End chunk at {chunk_cursor}")
             break
 
         else:
-            debug_print(f"Unrecognized chunk type 0x{chunk_type_identifier:02x} at {chunk_cursor} while parsing plist")
+            debug_print(f"PLIST: Unrecognized chunk type 0x{chunk_type_identifier:02x} at {chunk_cursor}")
             return
         
         chunk_cursor += 4
@@ -285,10 +293,8 @@ def load_chunk_model(context, buffer, base):
     mesh = bpy.data.meshes.new("NinjaChunkModel")
     working_bmesh = bmesh.new()
 
-    debug_print(f"Vlist pointer: {vlist_ptr}")
-    parse_chunk_model_vlist(working_bmesh, buffer, vlist_ptr - _ptr_offset)
-    debug_print(f"Plist pointer: {plist_ptr}")
-    parse_chunk_model_plist(working_bmesh, buffer, plist_ptr - _ptr_offset)
+    parse_chunk_model_vlist(working_bmesh, buffer, vlist_ptr)
+    parse_chunk_model_plist(working_bmesh, buffer, plist_ptr)
 
     working_bmesh.to_mesh(mesh)
     working_bmesh.free()
@@ -300,7 +306,7 @@ def load_chunk_object(context, buffer, base=0, parent=None):
     eval_flags  = int.from_bytes(        buffer[base+ 0:base+ 4], 'little')
     model_ptr   = int.from_bytes(        buffer[base+ 4:base+ 8], 'little')
     o_position  = struct.unpack ('<fff', buffer[base+ 8:base+20])
-    o_angle     = struct.unpack ('<fff', buffer[base+20:base+32])
+    o_angle     = struct.unpack ('<III', buffer[base+20:base+32])
     o_scale     = struct.unpack ('<fff', buffer[base+32:base+44])
     child_ptr   = int.from_bytes(        buffer[base+44:base+48], 'little')
     sibling_ptr = int.from_bytes(        buffer[base+48:base+52], 'little')
@@ -308,27 +314,28 @@ def load_chunk_object(context, buffer, base=0, parent=None):
     mesh = None
 
     if (model_ptr != 0):
-        debug_print(f"Model pointer: {model_ptr - _ptr_offset}")
-        mesh = load_chunk_model(context, buffer, model_ptr - _ptr_offset)
+        debug_print(f"NJCO: Model pointer: {model_ptr}")
+        mesh = load_chunk_model(context, buffer, model_ptr)
 
     object = bpy.data.objects.new("NinjaChunkObject", mesh)
 
     object.parent = parent
-    object.location = mathutils.Vector((o_position))
-    #angle idk if euler or smth else so we will ignore for now
-    object.scale    = mathutils.Vector((o_scale))
-    
+
+    object.location = Vector((o_position))
+    object.rotation_euler = Euler([angle_to_rad(angle) for angle in o_angle])
+    object.scale = Vector((o_scale))
+
     context.collection.objects.link(object)
     
     object.select_set(True)
 
     if (child_ptr != 0): 
-        debug_print(f"Model pointer: {model_ptr - _ptr_offset}")
-        load_chunk_object(context, buffer, child_ptr - _ptr_offset, object)
+        debug_print(f"NJCO: Child pointer: {model_ptr}")
+        load_chunk_object(context, buffer, child_ptr, object)
     
     if (sibling_ptr != 0): 
-        debug_print(f"Sibling pointer: {model_ptr - _ptr_offset}")
-        load_chunk_object(context, buffer, sibling_ptr - _ptr_offset, parent)
+        debug_print(f"NJCO: Sibling pointer: {model_ptr}")
+        load_chunk_object(context, buffer, sibling_ptr, parent)
 
     return object
 
@@ -339,29 +346,30 @@ def load(operator, context):
 
     file_size = os.path.getsize(operator.filepath)
 
-    match operator.format:
-        case 'IFF_CONTAINER':
-            _ptr_offset = 0
-            with open(operator.filepath, 'rb') as file:
-                while (file.tell() < file_size):
-                    chunk_type = file.read(4)
-                    chunk_size = int.from_bytes(file.read(4), 'little')
-                    chunk_base = file.tell()
+    global_matrix = axis_conversion(
+        from_forward = operator.axis_forward,
+        from_up = operator.axis_up,
+    ).to_4x4()
 
-                    match chunk_type:
-                        case b'NJCM': # chunk model
-                            debug_print(f"NJCM chunk at {chunk_base}")
-                            load_chunk_object(context, file.read(chunk_size))
-                        case b'NJBM': # basic model
-                            pass
+    # transforming each object individually is hard so we're doing this for now
+    root = bpy.data.objects.new("NinjaRoot", None)
+    root.matrix_world = global_matrix
+    context.collection.objects.link(root)
 
-                    file.seek(chunk_base + chunk_size, os.SEEK_SET)
+    with open(operator.filepath, 'rb') as file:
+        while (file.tell() < file_size):
+            chunk_type = file.read(4)
+            chunk_size = int.from_bytes(file.read(4), 'little')
+            chunk_base = file.tell()
+
+            debug_print(f"IFF: {chunk_type.decode('ascii')} chunk at {chunk_base}")
+
+            match chunk_type:
+                case b'NJCM': # chunk model
+                    load_chunk_object(context, file.read(chunk_size), parent=root)
+                case b'NJBM': # basic model
+                    pass
+
+            file.seek(chunk_base + chunk_size, os.SEEK_SET)
                     
-        case 'CHUNK_MODEL':
-            _ptr_offset = operator.pointer_offset
-            
-        case 'BASIC_MODEL':
-            _ptr_offset = operator.pointer_offset
-            
-
     return {'FINISHED'}
